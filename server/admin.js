@@ -10,11 +10,23 @@ if (!process.env.DATABASE_URL) {
   process.exit(1);
 }
 
-const upload = multer({ dest: 'uploads/' });
+const upload = multer({ 
+  dest: 'uploads/',
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Not an image! Please upload an image.'), false);
+    }
+  },
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  }
 
+ });
 const app = express();
-app.use(express.json()); 
-app.use(express.urlencoded({ extended: true })); 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -27,8 +39,7 @@ async function createMoviesTable() {
       CREATE TABLE IF NOT EXISTS movies (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
-        time_in VARCHAR(8) NOT NULL,
-        time_out VARCHAR(8) NOT NULL
+        moviePoster BYTEA
       );
     `);
     console.log('Movies table created or already exists');
@@ -45,6 +56,89 @@ createMoviesTable().catch(error => {
 });
 
 app.post("/upload", upload.single('movieScript'), async (req, res) => {
+  // console.log("Received request to upload poster");
+  // console.log("File:", req.file);
+  // console.log("Movie name:", req.body.movieName);
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const movieName = req.body.movieName;
+    const moviePoster = req.body.moviePoster; // New field for movie poster URL
+
+    if (!movieName) {
+      return res.status(400).json({ error: "Movie name is required" });
+    }
+
+    const results = [];
+    fs.createReadStream(req.file.path)
+      .pipe(csv())
+      .on('data', (data) => {
+        console.log("CSV row:", data);
+        results.push(data);
+      })
+      .on('end', async () => {
+        if (results.length === 0) {
+          return res.status(400).json({ error: "No data found in CSV" });
+        }
+
+        console.log("First row of CSV:", results[0]);
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+
+          const tableName = `"${movieName.replace(/"/g, '""')}"`;
+          
+          const columns = Object.keys(results[0]);
+          console.log("CSV columns:", columns);
+
+          const createTableQuery = `
+            CREATE TABLE IF NOT EXISTS ${tableName} (
+              Serial_no SERIAL PRIMARY KEY,
+              ${columns.map(col => `"${col}" TEXT`).join(', ')}
+            )
+          `;
+          console.log("Create table query:", createTableQuery);
+          await client.query(createTableQuery);
+
+          for (const row of results) {
+            const insertQuery = `
+              INSERT INTO ${tableName} (${columns.map(col => `"${col}"`).join(', ')})
+              VALUES (${columns.map((_, i) => `$${i + 1}`).join(', ')})
+            `;
+            const values = columns.map(col => row[col]);
+            console.log("Insert query:", insertQuery);
+            console.log("Insert values:", values);
+            await client.query(insertQuery, values);
+          }
+
+          const result = await client.query(
+            "INSERT INTO movies (name, moviePoster) VALUES ($1, $2) RETURNING *",
+            [movieName, moviePoster]
+          );
+
+          await client.query('COMMIT');
+          fs.unlinkSync(req.file.path);
+          res.status(201).json(result.rows[0]);
+        } catch (error) {
+          await client.query('ROLLBACK');
+          console.error("Database error:", error.message);
+          res.status(500).send("Server Error: " + error.message);
+        } finally {
+          client.release();
+        }
+      });
+  } catch (error) {
+    console.error("Server error:", error.message);
+    res.status(500).send("Server Error: " + error.message);
+  }
+
+});
+
+// Endpoint for uploading movie poster
+app.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -55,60 +149,72 @@ app.post("/upload", upload.single('movieScript'), async (req, res) => {
       return res.status(400).json({ error: "Movie name is required" });
     }
 
-    const results = [];
-    fs.createReadStream(req.file.path)
-      .pipe(csv())
-      .on('data', (data) => results.push(data))
-      .on('end', async () => {
-        if (results.length === 0) {
-          return res.status(400).json({ error: "No data found in CSV" });
-        }
+    // Validate image type
+    const buffer = fs.readFileSync(req.file.path);
+    const type = imageType(buffer);
+    if (!type || !type.mime.startsWith('image/')) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: "Uploaded file is not a valid image" });
+    }
 
-        const timeIn = results[0].time_in;
-        const timeOut = results[results.length - 1].time_out;
+    const client = await pool.connect();
+    try {
+      // Update the movie record with the poster data as bytea
+      const result = await client.query(
+        "UPDATE movies SET moviePoster = $1 WHERE name = $2 RETURNING *",
+        [buffer, movieName]
+      );
 
-        const client = await pool.connect();
-        try {
-          await client.query('BEGIN');
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Movie not found" });
+      }
 
-          const tableName = `"${movieName.replace(/"/g, '""')}"`;
-          await client.query(`
-            CREATE TABLE IF NOT EXISTS ${tableName} (
-              id SERIAL PRIMARY KEY,
-              time_in TEXT,
-              time_out TEXT,
-              dialogue TEXT
-            )
-          `);
+      // Delete the temporary file
+      fs.unlinkSync(req.file.path);
 
-          for (const row of results) {
-            await client.query(
-              `INSERT INTO ${tableName} (time_in, time_out, dialogue) VALUES ($1, $2, $3)`,
-              [row.time_in, row.time_out, row.dialogue]
-            );
-          }
-
-          const result = await client.query(
-            "INSERT INTO movies (name, time_in, time_out) VALUES ($1, $2, $3) RETURNING *",
-            [movieName, timeIn, timeOut]
-          );
-
-          await client.query('COMMIT');
-
-          fs.unlinkSync(req.file.path);
-
-          res.status(201).json(result.rows[0]);
-        } catch (error) {
-          await client.query('ROLLBACK');
-          console.error(error.message);
-          res.status(500).send("Server Error");
-        } finally {
-          client.release();
-        }
-      });
+      res.status(200).json({ message: "Poster uploaded successfully", movie: result.rows[0] });
+    } finally {
+      client.release();
+    }
   } catch (error) {
-    console.error(error.message);
-    res.status(500).send("Server Error");
+    console.error("Server error:", error.message);
+    res.status(500).send("Server Error: " + error.message);
+  }
+});
+
+// Endpoint for retrieving movie poster
+app.get("/movie-poster/:movieName", async (req, res) => {
+  const movieName = req.params.movieName;
+
+  const client = await pool.connect();
+  try {
+    const result = await client.query(
+      "SELECT moviePoster FROM movies WHERE name = $1",
+      [movieName]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Movie not found" });
+    }
+
+    const posterData = result.rows[0].movieposter;
+
+    // Detect the image type
+    const type = imageType(posterData);
+    if (!type) {
+      return res.status(500).json({ error: "Invalid image data" });
+    }
+
+    // Set the correct content type
+    res.contentType(type.mime);
+
+    // Send the image data
+    res.send(posterData);
+  } catch (error) {
+    console.error("Database error:", error.message);
+    res.status(500).send("Server Error: " + error.message);
+  } finally {
+    client.release();
   }
 });
 
@@ -116,126 +222,3 @@ const port = 3000;
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
 });
-
-// const express = require('express');
-// const busboy = require('busboy');
-// const csv = require('csv-parser');
-// const { Pool } = require('pg');
-// const fs = require('fs');
-// const path = require('path');
-
-// const app = express();
-
-// if (!process.env.DATABASE_URL) {
-//   console.error('DATABASE_URL is not set.');
-//   process.exit(1);
-
-// } else {
-//   console.log('DATABASE_URL is set.');
-// }
-
-// // Ensure the uploads directory exists
-// const uploadPath = path.join(__dirname, 'uploads');
-// fs.mkdirSync(uploadPath, { recursive: true });
-
-// // Database connection
-// const pool = new Pool({
-//   connectionString: process.env.DATABASE_URL,
-// });
-
-// app.post('/upload', (req, res) => {
-//   const bb = busboy({ headers: req.headers });
-//   let movieName = '';
-//   let csvFilePath = '';
-
-//   bb.on('field', (name, val) => {
-//     if (name === 'movieName') {
-//       movieName = val;
-//     }
-//   });
-
-//   bb.on('file', (name, file, info) => {
-//     if (name === 'movieScript') {
-//       const saveTo = path.join(uploadPath, `${Date.now()}-${info.filename}`);
-//       csvFilePath = saveTo;
-//       file.pipe(fs.createWriteStream(saveTo));
-//     }
-//   });
-
-//   bb.on('finish', async () => {
-//     if (!movieName) {
-//       return res.status(400).json({ error: "Movie name is required" });
-//     }
-//     if (!csvFilePath) {
-//       return res.status(400).json({ error: "No file uploaded" });
-//     }
-
-//     try {
-//       const results = [];
-//       fs.createReadStream(csvFilePath)
-//         .pipe(csv())
-//         .on('data', (data) => results.push(data))
-//         .on('end', async () => {
-//           if (results.length === 0) {
-//             return res.status(400).json({ error: "No data found in CSV" });
-//           }
-
-//           const timeIn = results[0].time_in;
-//           const timeOut = results[results.length - 1].time_out;
-
-//           const client = await pool.connect();
-//           try {
-//             await client.query('BEGIN');
-
-//             // Create a new table for the movie script
-//             const tableName = `"${movieName.replace(/"/g, '""')}"`;
-//             await client.query(`
-//               CREATE TABLE IF NOT EXISTS ${tableName} (
-//                 id SERIAL PRIMARY KEY,
-//                 time_in TEXT,
-//                 time_out TEXT,
-//                 dialogue TEXT
-//               )
-//             `);
-
-//             // Insert script lines into the new table
-//             for (const row of results) {
-//               await client.query(
-//                 `INSERT INTO ${tableName} (time_in, time_out, dialogue) VALUES ($1, $2, $3)`,
-//                 [row.time_in, row.time_out, row.dialogue]
-//               );
-//             }
-
-//             // Insert movie details into the movies table
-//             const result = await client.query(
-//               "INSERT INTO movies (name, time_in, time_out) VALUES ($1, $2, $3) RETURNING *",
-//               [movieName, timeIn, timeOut]
-//             );
-
-//             await client.query('COMMIT');
-            
-//             // Delete the uploaded file
-//             fs.unlinkSync(csvFilePath);
-
-//             res.status(201).json(result.rows[0]);
-//           } catch (error) {
-//             await client.query('ROLLBACK');
-//             console.error('Database error:', error);
-//             res.status(500).json({ error: "Server error" });
-//           } finally {
-//             client.release();
-//           }
-//         });
-//     } catch (error) {
-//       console.error('File processing error:', error);
-//       res.status(500).json({ error: "Server error" });
-//     }
-//   });
-
-//   req.pipe(bb);
-// });
-
-// const port = process.env.PORT || 3000;
-// app.listen(port, () => {
-//   console.log(`Server is running on port ${port}`);
-// });

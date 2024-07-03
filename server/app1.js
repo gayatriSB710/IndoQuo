@@ -119,28 +119,32 @@ app.post('/suggestions', async (req, res) => {
 
 // const port = process.env.PORT || 3000;
 
+const { Pool } = require('pg');
+const format = require('pg-format');
+
 app.get('/search', async (req, res) => {
   try {
     const userInput = req.query.q || '';
     const client = await pool.connect();
 
-    // Get a list of all tables in the database
-    const tableListQuery = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';";
+    // Get a list of all tables in the database, excluding 'movies'
+    const tableListQuery = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name != 'movies' AND table_name != `users`;";
     const tableListResult = await client.query(tableListQuery);
     const tableNames = tableListResult.rows.map(row => row.table_name);
 
-    // Construct a dynamic SQL query to search all tables
-    let unionQuery = '';
-    for (const table of tableNames) {
-      unionQuery += `SELECT context, '${table}' AS table_name FROM ${table} WHERE context LIKE $1 UNION ALL `;
-    }
-    unionQuery = unionQuery.slice(0, -10); // Remove the trailing 'UNION ALL '
+    // Construct a dynamic SQL query to search all tables except 'movies'
+    let unionQueries = tableNames.map(table => {
+      // Use double quotes for table names to handle spaces and special characters
+      return format('SELECT context, %L AS table_name FROM %I WHERE context ILIKE $1', table, table);
+    });
+
+    const unionQuery = unionQueries.join(' UNION ALL ');
 
     const searchTerm = `%${userInput}%`;
-    console.log(unionQuery)
+    console.log(unionQuery);
+
     const result = await client.query(unionQuery, [searchTerm]);
     const data = result.rows;
-
     client.release();
     res.json(data);
   } catch (error) {

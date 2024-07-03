@@ -7,7 +7,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(express.json());
-const port = process.env.PORT || 5000;
+const port = process.env.PORT || 3000;
 app.use(cors());
 
 const pool = new Pool({
@@ -56,11 +56,15 @@ app.post("/login", async (req, res) => {
       return res.status(400).json({ message: "Invalid Credentials" });
     }
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, isAdmin: true }, // Set isAdmin to true for all logged-in users
       process.env.SECRET_KEY || '0b1ac8dd8197e876ab946f8ca7d480e95c3e7a2910033fbc0ac94ae8e5e40b3e1519a880a9663e949d38274d57693aa23aaf4d955cb9b200df4cb7d4db575316',
       { expiresIn: "1d" }
     );
-    res.json({ token });
+    // Send back the token and redirect to admin page
+    res.json({ 
+      token, 
+      redirectTo: '/admin.js'
+    });
   } catch (error) {
     console.error(error.message);
     res.status(500).send("Server Error");
