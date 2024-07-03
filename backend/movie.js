@@ -1,14 +1,14 @@
-require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const csv = require('csv-parser');
-const { Pool } = require('pg');
 const fs = require('fs');
+let imageType;
+import('image-type').then((module) => {
+    imageType = module.default;
+}).catch(err => console.error(err));
+const { pool } = require('./db');
 
-if (!process.env.DATABASE_URL) {
-  console.error('DATABASE_URL is not set.');
-  process.exit(1);
-}
+const router = express.Router();
 
 const upload = multer({ 
   dest: 'uploads/',
@@ -22,50 +22,16 @@ const upload = multer({
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB limit
   }
-
- });
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
 });
 
-async function createMoviesTable() {
-  const client = await pool.connect();
-  try {
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS movies (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        moviePoster BYTEA
-      );
-    `);
-    console.log('Movies table created or already exists');
-  } catch (error) {
-    console.error('Error creating movies table:', error);
-  } finally {
-    client.release();
-  }
-}
-
-createMoviesTable().catch(error => {
-  console.error('Failed to create movies table:', error);
-  process.exit(1);
-});
-
-app.post("/upload", upload.single('movieScript'), async (req, res) => {
-  // console.log("Received request to upload poster");
-  // console.log("File:", req.file);
-  // console.log("Movie name:", req.body.movieName);
+router.post("/upload", upload.single('movieScript'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
     const movieName = req.body.movieName;
-    const moviePoster = req.body.moviePoster; // New field for movie poster URL
+    const moviePoster = req.body.moviePoster;
 
     if (!movieName) {
       return res.status(400).json({ error: "Movie name is required" });
@@ -134,11 +100,9 @@ app.post("/upload", upload.single('movieScript'), async (req, res) => {
     console.error("Server error:", error.message);
     res.status(500).send("Server Error: " + error.message);
   }
-
 });
 
-// Endpoint for uploading movie poster
-app.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
+router.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
@@ -149,7 +113,6 @@ app.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
       return res.status(400).json({ error: "Movie name is required" });
     }
 
-    // Validate image type
     const buffer = fs.readFileSync(req.file.path);
     const type = imageType(buffer);
     if (!type || !type.mime.startsWith('image/')) {
@@ -159,7 +122,6 @@ app.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
 
     const client = await pool.connect();
     try {
-      // Update the movie record with the poster data as bytea
       const result = await client.query(
         "UPDATE movies SET moviePoster = $1 WHERE name = $2 RETURNING *",
         [buffer, movieName]
@@ -169,7 +131,6 @@ app.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
         return res.status(404).json({ error: "Movie not found" });
       }
 
-      // Delete the temporary file
       fs.unlinkSync(req.file.path);
 
       res.status(200).json({ message: "Poster uploaded successfully", movie: result.rows[0] });
@@ -182,8 +143,7 @@ app.post("/upload-poster", upload.single('moviePoster'), async (req, res) => {
   }
 });
 
-// Endpoint for retrieving movie poster
-app.get("/movie-poster/:movieName", async (req, res) => {
+router.get("/movie-poster/:movieName", async (req, res) => {
   const movieName = req.params.movieName;
 
   const client = await pool.connect();
@@ -199,16 +159,12 @@ app.get("/movie-poster/:movieName", async (req, res) => {
 
     const posterData = result.rows[0].movieposter;
 
-    // Detect the image type
     const type = imageType(posterData);
     if (!type) {
       return res.status(500).json({ error: "Invalid image data" });
     }
 
-    // Set the correct content type
     res.contentType(type.mime);
-
-    // Send the image data
     res.send(posterData);
   } catch (error) {
     console.error("Database error:", error.message);
@@ -218,7 +174,4 @@ app.get("/movie-poster/:movieName", async (req, res) => {
   }
 });
 
-const port = 3000;
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
-});
+module.exports = router;
